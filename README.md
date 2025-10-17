@@ -1,2 +1,2 @@
-# Python-Automation-Emails
+# Python-Lease Automation for Emails
 Automating renewal work flow
