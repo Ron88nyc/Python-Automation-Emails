@@ -3,7 +3,7 @@ Automated Lease Renewal Reminder System
 ---------------------------------------
 This script reads lease data from an Excel sheet and sends personalized renewal reminder emails
 via Outlook's SMTP server (Office365). It automatically detects which tenants are
-~60 days or ~30 days away from their lease end and emails them accordingly.
+60 days or 30 days away from their lease end and emails them accordingly.
 
 ✅ Sends reminders weekly (every Saturday at 10am) using APScheduler
 ✅ Avoids duplicates (won’t re-send within 21 days)
