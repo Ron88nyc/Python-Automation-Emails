@@ -1,227 +1,202 @@
 """
-Automated Lease Renewal Reminder System
----------------------------------------
-This script reads lease data from an Excel sheet and sends personalized renewal reminder emails
-via Outlook's SMTP server (Office365). It automatically detects which tenants are
-60 days or 30 days away from their lease end and emails them accordingly.
+Lease Renewal Automation Script
+Author: Ronald Li
 
-✅ Sends reminders weekly (every Saturday at 10am) using APScheduler
-✅ Avoids duplicates (won’t re-send within 21 days)
-✅ Updates Excel with last sent date
-✅ Logs all actions to send_log.csv
-
-Folder layout suggestion:
-lease_renewal_automation/
-  ├─ send_renewals_outlook_excel.py   <-- this script
-  ├─ .env                             <-- environment variables (SMTP settings)
-  └─ prospects.xlsx                   <-- your data
+Features:
+  • Reads lease data from Excel
+  • Finds tenants with leases ending in 60 or 30 days
+  • Sends HTML renewal reminders via SendGrid SMTP
+  • Logs every action to renewal_log.txt
+  • (Optional) Runs automatically every Saturday at 10:00 AM with APScheduler
 """
 
 import os
 import smtplib
-import traceback
-from datetime import date, datetime
-from email.message import EmailMessage
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 import pandas as pd
-from apscheduler.schedulers.blocking import BlockingScheduler  # for weekly scheduling
-from dotenv import load_dotenv  # loads environment variables from a .env file if present
+from apscheduler.schedulers.blocking import BlockingScheduler
+from dotenv import load_dotenv
 
-# Load .env values (optional but convenient for local dev)
-# If a .env file exists next to the script, its variables will be loaded into the environment.
+# ---------------------------------------------------------------------------
+# 1️⃣ Config & Environment
+# ---------------------------------------------------------------------------
+
 load_dotenv()
 
-# ============ SETTINGS YOU CAN CUSTOMIZE ============
-
-EXCEL_PATH = "prospects.xlsx"        # Excel file containing tenant/prospect data
-SHEET_NAME = "Prospects"             # Sheet name inside the Excel file
-LOG_PATH = "send_log.csv"            # Log file to track actions
-
-# Outlook SMTP settings (use environment variables for security)
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.office365.com")
+# SendGrid SMTP (from your .env)
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.sendgrid.net")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASS = os.getenv("SMTP_PASS")
+SMTP_USER = os.getenv("SMTP_USER", "apikey")      # SendGrid uses literal "apikey"
+SMTP_PASS = os.getenv("SMTP_PASS", "")            # Your SendGrid API key
+FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER)   # Verified sender in SendGrid
 
-# Milestones: how many days before lease end to send reminders
-# "tolerance" gives flexibility (e.g., run Saturday but catch Thursday or Friday expirations too)
-MILESTONES = [
-    {"days": 60, "tolerance": 2, "col": "last_sent_60"},
-    {"days": 30, "tolerance": 2, "col": "last_sent_30"},
-]
+# Excel file with lease data
+EXCEL_FILE = "leases.xlsx"
 
-COOLDOWN_DAYS = 21  # don't re-send within this period
-DRY_RUN = False     # if True, prints but doesn't actually send emails
+# Log file
+LOG_FILE = "renewal_log.txt"
 
-# Email templates (use {placeholders} to personalize content)
-SUBJECT_60 = "Let's lock in renewal options for {property} — Unit {unit}"
-SUBJECT_30 = "30 days left for {property} — Renewal options for Unit {unit}"
+# Toggle to avoid sending real emails while testing
+DRY_RUN = False  # True = only print + log "DRY_RUN", no real sends
 
-HTML_60 = """
-<p>Hi {first_name},</p>
-<p>Your lease for <b>{property} – {unit}</b> ends on <b>{lease_end_fmt}</b> (about 60 days out).</p>
-<p>We’d love to help you renew early and secure the best terms.</p>
-<ul>
-  <li>Flexible term lengths</li>
-  <li>Priority maintenance scheduling</li>
-  <li>Fast digital paperwork</li>
-</ul>
-<p>Reply to this email to get started or schedule a quick call.</p>
-<p>Thanks!<br>Resident Relations</p>
-<hr><p style="font-size:12px;color:#666">To stop renewal emails, reply “STOP”.</p>
-"""
 
-HTML_30 = """
-<p>Hi {first_name},</p>
-<p>Quick reminder: your lease for <b>{property} – {unit}</b> ends on <b>{lease_end_fmt}</b> (about 30 days).</p>
-<p>We can finalize your renewal in minutes—reply here and we’ll prepare options.</p>
-<p>Thanks!<br>Resident Relations</p>
-<hr><p style="font-size:12px;color:#666">To stop renewal emails, reply “STOP”.</p>
-"""
+# ---------------------------------------------------------------------------
+# 2️⃣ Logging helper
+# ---------------------------------------------------------------------------
 
-# ============ HELPER FUNCTIONS ============
+def log_event(tenant: str, email: str, days_left: int, status: str, message: str = ""):
+    """
+    Append a line to renewal_log.txt
 
-def parse_date(cell):
-    """Safely convert a cell value to a Python date (handles Excel, string, or empty)."""
-    if pd.isna(cell) or cell == "":
-        return None
-    if isinstance(cell, (datetime, pd.Timestamp)):
-        return cell.date()
-    if isinstance(cell, date):
-        return cell
-    try:
-        return pd.to_datetime(cell).date()
-    except Exception:
-        return None
+    status: "SENT", "DRY_RUN", "ERROR"
+    """
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{timestamp} | {status:<7} | {days_left:>3} days | {tenant} <{email}> | {message}\n"
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line)
 
-def within_window(days_until, target, tol):
-    """Returns True if today is within ±tol days of the target window."""
-    return (target - tol) <= days_until <= (target + tol)
 
-def send_outlook(to_addr, subject, html):
-    """Send an HTML email using Outlook's SMTP service."""
-    msg = EmailMessage()
-    msg["From"] = SMTP_USER
-    msg["To"] = to_addr
-    msg["Subject"] = subject
-    msg.set_content("This message contains HTML content.")
-    msg.add_alternative(html, subtype="html")
+# ---------------------------------------------------------------------------
+# 3️⃣ Email sending via SendGrid SMTP
+# ---------------------------------------------------------------------------
+
+def send_smtp(to_addr: str, subject: str, html_content: str, tenant: str, days_left: int):
+    """
+    Send an HTML email using SendGrid SMTP.
+
+    Uses:
+      SMTP_HOST, SMTP_PORT, SMTP_USER ('apikey'), SMTP_PASS (API key), FROM_EMAIL
+    """
 
     if DRY_RUN:
         print(f"[DRY-RUN] Would send to {to_addr}: {subject}")
+        log_event(tenant, to_addr, days_left, "DRY_RUN", "No email sent (DRY_RUN=True)")
         return
 
-    # Connect to Outlook SMTP, start TLS encryption, log in, and send
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-        s.starttls()
-        s.login(SMTP_USER, SMTP_PASS)
-        s.send_message(msg)
+    msg = MIMEMultipart("alternative")
+    msg["From"] = FROM_EMAIL
+    msg["To"] = to_addr
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_content, "html"))
 
-def log(status, email, note=""):
-    """Append an entry to the log CSV file."""
-    ts = datetime.now().isoformat(timespec="seconds")
-    line = f'{ts},{email},{status},"{note.replace(",", ";")}"\n'
-    new = not os.path.exists(LOG_PATH)
-    with open(LOG_PATH, "a", encoding="utf-8") as f:
-        if new:
-            f.write("ts,email,status,note\n")
-        f.write(line)
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
 
-# ============ CORE FUNCTION ============
+        print(f"✅ Sent email to {to_addr} via SendGrid SMTP")
+        log_event(tenant, to_addr, days_left, "SENT", "OK")
 
-def process_reminders():
-    """Main workflow: reads Excel, filters who to email, sends reminders, updates sheet."""
-    print(f"\n[RUNNING] Lease renewal reminder check — {datetime.now()}\n")
+    except Exception as e:
+        err = str(e)
+        print(f"❌ Error sending to {to_addr}: {err}")
+        log_event(tenant, to_addr, days_left, "ERROR", err)
 
-    if not (SMTP_USER and SMTP_PASS):
-        raise SystemExit("Missing SMTP_USER/SMTP_PASS environment variables. "
-                         "Create a .env file or set them in your OS environment.")
 
-    # Read Excel data
-    df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME, engine="openpyxl")
+# ---------------------------------------------------------------------------
+# 4️⃣ Lease processing & reminder logic
+# ---------------------------------------------------------------------------
 
-    # Ensure the tracking columns exist
-    for m in MILESTONES:
-        if m["col"] not in df.columns:
-            df[m["col"]] = ""
+def process_lease_data():
+    """
+    Load leases.xlsx, find tenants exactly 60 or 30 days from lease end,
+    and send them reminders.
 
-    today = date.today()
-    sent_counter = {m["col"]: 0 for m in MILESTONES}
+    Expected columns in Excel:
+      Tenant, Email, Lease_End_Date
+    """
 
-    # Loop through every tenant row
-    for idx, row in df.iterrows():
-        email_addr = str(row.get("email") or "").strip()
-        if not email_addr:
-            continue  # skip empty emails
+    if not os.path.exists(EXCEL_FILE):
+        print(f"⚠️ Excel file not found: {EXCEL_FILE}")
+        return
 
-        if str(row.get("opted_out") or "").lower() in ("true", "yes", "1"):
-            log("skip", email_addr, "opted_out")
+    df = pd.read_excel(EXCEL_FILE)
+
+    # Normalize columns (adjust these if your headers differ)
+    required_cols = ["Tenant", "Email", "Lease_End_Date"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column in Excel: {col}")
+
+    # Parse dates
+    df["Lease_End_Date"] = pd.to_datetime(df["Lease_End_Date"], errors="coerce")
+
+    today = datetime.today().date()
+    df["Days_Remaining"] = (df["Lease_End_Date"].dt.date - today).dt.days
+
+    # Filter for exactly 60 or 30 days remaining
+    targets = df[df["Days_Remaining"].isin([60, 30])]
+
+    if targets.empty:
+        print("No leases at 60 or 30 days today.")
+        return
+
+    print(f"Found {len(targets)} leases at 60 or 30 days. Processing...\n")
+
+    for _, row in targets.iterrows():
+        tenant = str(row["Tenant"]).strip()
+        email = str(row["Email"]).strip()
+        days_left = int(row["Days_Remaining"])
+
+        if not email or email.lower() == "nan":
+            print(f"Skipping {tenant}: no email.")
+            log_event(tenant, "N/A", days_left, "ERROR", "Missing email")
             continue
 
-        lease_end = parse_date(row.get("lease_end_date"))
-        if not lease_end:
-            log("skip", email_addr, "invalid lease_end_date")
-            continue
+        subject = f"Lease Renewal Reminder - {days_left} Days Remaining"
 
-        days_until = (lease_end - today).days
-        lease_end_fmt = lease_end.strftime("%b %d, %Y")
+        html = f"""
+        <html>
+          <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;">
+            <p>Hi {tenant},</p>
+            <p>This is a friendly reminder that your lease is ending in <b>{days_left} days</b>.</p>
+            <p>If you’d like to renew or discuss options, please reply to this email and our team will assist.</p>
+            <p>Thank you,<br>Rose Property Management</p>
+          </body>
+        </html>
+        """
 
-        # Check both 60-day and 30-day windows
-        for m in MILESTONES:
-            last_sent = parse_date(row.get(m["col"]))
-            # skip if recently emailed for this milestone
-            if last_sent and (today - last_sent).days < COOLDOWN_DAYS:
-                continue
+        send_smtp(email, subject, html, tenant, days_left)
 
-            if within_window(days_until, m["days"], m["tolerance"]):
-                ctx = {
-                    "first_name": str(row.get("first_name") or "there").strip(),
-                    "property": str(row.get("property") or "").strip(),
-                    "unit": str(row.get("unit") or "").strip(),
-                    "lease_end_fmt": lease_end_fmt,
-                }
 
-                # Select the right template based on milestone
-                if m["days"] == 60:
-                    subject = SUBJECT_60.format(**ctx)
-                    html = HTML_60.format(**ctx)
-                else:
-                    subject = SUBJECT_30.format(**ctx)
-                    html = HTML_30.format(**ctx)
+# ---------------------------------------------------------------------------
+# 5️⃣ Weekly scheduler (every Saturday 10:00 AM)
+# ---------------------------------------------------------------------------
 
-                try:
-                    send_outlook(email_addr, subject, html)
-                    df.at[idx, m["col"]] = today.strftime("%Y-%m-%d")  # stamp that we emailed
-                    sent_counter[m["col"]] += 1
-                    log("sent", email_addr, f"milestone={m['days']}")
-                except Exception:
-                    log("error", email_addr, traceback.format_exc()[:300])
-
-    # Save updated Excel back
-    with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl", mode="w") as writer:
-        df.to_excel(writer, index=False, sheet_name=SHEET_NAME)
-
-    print(f"Done. Sent summary: {sent_counter}\n")
-
-# ============ SCHEDULER (RUN EVERY SATURDAY) ============
-
-def start_weekly_scheduler():
-    """Schedules the reminder process to run automatically every Saturday at 10am."""
+def schedule_weekly_run():
+    """
+    Run process_lease_data() automatically every Saturday at 10:00 AM.
+    """
     scheduler = BlockingScheduler()
 
-    # Cron-style schedule: run at hour 10, day_of_week 'sat'
-    @scheduler.scheduled_job('cron', day_of_week='sat', hour=10)
-    def weekly_job():
-        process_reminders()
+    # day_of_week='sat' (0=mon .. 6=sun), hour=10 (10:00)
+    scheduler.add_job(process_lease_data, "cron", day_of_week="sat", hour=10)
 
-    print("Scheduler started — reminders will run every Saturday at 10:00 AM.")
+    print("🕒 Scheduler started. Reminders will run every Saturday at 10:00 AM.")
     scheduler.start()
 
-# ============ RUN ============
-if __name__ == "__main__":
-    # Choose one of the two lines below:
-    # 1) Run once (good for testing)
-    # process_reminders()
 
-    # 2) Run forever and send every Saturday at 10am (production)
-    start_weekly_scheduler()
+# ---------------------------------------------------------------------------
+# 6️⃣ Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # For development:
+    #   - Set DRY_RUN = True above
+    #   - Run once to see which emails would go out
+    #
+    # For production:
+    #   - Set DRY_RUN = False
+    #   - Use schedule_weekly_run() OR a system scheduler calling this script
+
+    print("🚀 Running Lease Renewal Automation...\n")
+
+    # Option A: run once and exit
+    process_lease_data()
+
+    # Option B: enable weekly scheduler (uncomment when ready)
+    # schedule_weekly_run()
